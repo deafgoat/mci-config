@@ -1,3 +1,3 @@
-ownername: deafgoat
-tasks:
-- name: repotracker
+random config
+with [] {} a bunch:
+of unparsable yaml - :)
