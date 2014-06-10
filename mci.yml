@@ -1,0 +1,2341 @@
+
+functions:
+  "fetch source" :
+    command: git.get_project
+    params:
+      directory: src
+  "fetch artifacts" :
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${build_variant}/${build_id}.tgz
+      bucket: mciuploads
+      extract_to: src
+
+artifacts:
+  include:
+    - "src/mongo/db/modules/enterprise/jstests/**"
+    - "compile_expansions.yml"
+    - "src/mongo/db/modules/subscription/jstests/**"
+    - "*.tgz"
+    - "*.zip"
+    - "*.exe"
+    - "jstests/**"
+    - "./test*"
+    - "./dbtest*"
+    - "./mongobridge*"
+    - "buildscripts/**"
+    - "*Example"
+    - "*Test"
+    - "./**.pdb"
+    - "./**.msi"
+  excludefiles:
+    - "*_test.pdb"
+pre_run: |
+  -${killall_mci|pkill mongo; pkill -9 mongod; pkill -9 mongos; pkill -f buildlogger.py; pkill -f smoke.py}
+  rm -rf ${workdir|}
+  rm -rf /data/db/*
+post_run: |
+  -${killall_mci|pkill mongo; pkill -9 mongod; pkill -9 mongos; pkill -f buildlogger.py; pkill -f smoke.py}
+
+pre:
+  - command: expansions.fetch
+    params:
+      keys:
+        - local_key: "aws_key"
+          remote_key: "project_aws_key"
+        - local_key: "aws_secret"
+          remote_key: "project_aws_secret"
+  - command: shell.exec
+    params:
+      script: |
+        set -o verbose
+        rm -rf src || true
+        ${killall_mci|pkill mongo; pkill -9 mongod; pkill -9 mongos; pkill -f buildlogger.py; pkill -f smoke.py}
+        rm -rf /data/db/*
+        true
+
+post:
+  - command: attach.results
+    params:
+      file_location: src/report.json
+  - command: shell.exec
+    params:
+      script: |
+        ${killall_mci|pkill mongo; pkill -9 mongod; pkill -9 mongos; pkill -f buildlogger.py; pkill -f smoke.py}
+
+### tasks to be run for the branch ###
+
+tasks:
+
+## compile ##
+- name: compile
+  depends_on: []
+  invoke: |
+    ${scons|scons} ${compile_flags|} lint
+    rm -rf ${install_directory|/data/mongo-install-directory}
+    ${scons|scons} ${compile_flags|} all dist ${msi_target|}
+    ${grep|grep} -E 'versionString.. = ' src/mongo/util/version.cpp | ${grep|grep} -oE '"(.+)"' | sed 's/"//g' > version.txt
+    ${python|python} -c "ver = open('version.txt','r').read().strip(); print 'suffix: latest' if ver[-1] == '-' else 'suffix: ' + ver"  > compile_expansions.yml
+    if [ "${has_debugsymbols|}" = "true" ]; then ${scons|scons} ${compile_flags|} --nostrip dist; original_filename=$(ls | grep debugsymbols); mv $original_filename $(echo $original_filename | sed 's/debugsymbols-//' | sed 's/mongodb/debugsymbols-mongodb/'); fi
+  commands:
+    - command: git.get_project
+      params:
+        directory: src
+    - command: git.apply_patch
+      params:
+        directory: src
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          set -o errexit
+          set -o verbose
+          ${scons|scons} ${compile_flags|} lint
+          rm -rf ${install_directory|/data/mongo-install-directory}
+          ${scons|scons} ${compile_flags|} all dist ${msi_target|}
+          ${grep|grep} -E 'versionString.. = ' src/mongo/util/version.cpp | ${grep|grep} -oE '"(.+)"' | sed 's/"//g' > version.txt
+          ${python|python} -c "ver = open('version.txt','r').read().strip(); print 'suffix: latest' if ver[-1] == '-' else 'suffix: ' + ver"  > compile_expansions.yml
+          if [ "${has_debugsymbols|}" = "true" ]; then ${scons|scons} ${compile_flags|} --nostrip dist; original_filename=$(ls | grep debugsymbols); mv $original_filename $(echo $original_filename | sed 's/debugsymbols-//' | sed 's/mongodb/debugsymbols-mongodb/'); fi
+          ${python|python} buildscripts/smoke.py --with-cleanbb --mode files --from-file build/unittests.txt --dont-start-mongod  --report-file report.json --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} core
+    - command: archive.targz_pack
+      params:
+        target: "target.tgz"
+        source_dir: "src"
+        include:
+          - "src/mongo/db/modules/enterprise/jstests/**"
+          - "compile_expansions.yml"
+          - "src/mongo/db/modules/subscription/jstests/**"
+          - "*.tgz"
+          - "*.zip"
+          - "*.exe"
+          - "jstests/**"
+          - "./test*"
+          - "./dbtest*"
+          - "./mongobridge*"
+          - "buildscripts/**"
+          - "*Example"
+          - "*Test"
+          - "./**.pdb"
+          - "./**.msi"
+        exclude_files:
+          - "*_test.pdb"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: target.tgz
+        remote_file: ${build_variant}/${build_id}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+    - command: attach.task_files
+      params:
+        "artifacts": https://s3.amazonaws.com/mciuploads/${build_variant}/${build_id}.tgz
+
+## unit tests ##
+- name: unit_tests
+  depends_on:
+  - name: compile
+  invoke: |
+    ${python|python} buildscripts/smoke.py --with-cleanbb --mode files --from-file build/unittests.txt --dont-start-mongod  --report-file report.json --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} core
+
+## integration test suites ##
+
+- name: aggregation
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} aggregation
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} aggregation
+
+- name: aggregation_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth aggregation
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth aggregation
+
+- name: audit
+  depends_on: 
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} audit
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} audit
+
+- name: auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} auth
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} auth
+
+- name: dbtest
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} dbtest
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} dbtest
+
+- name: disk
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    rm -rf /data/db/diskfulltest/*
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} disk
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} disk
+
+- name: durability
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} dur
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} dur
+
+- name: failpoints
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} failPoint
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} failPoint
+
+- name: failpoints_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth failPoint
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth failPoint
+
+- name: gle_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} gle --auth
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} gle --auth
+
+- name: gle_auth_write_cmd
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} gle --auth --shell-write-mode commands
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} gle --auth --shell-write-mode commands
+
+- name: jsCore
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} jsCore
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} jsCore
+
+- name: jsCore_compatibility
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode compatibility --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} jsCore
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode compatibility --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} jsCore
+
+- name: jsCore_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth jsCore
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth jsCore
+
+- name: jsCore_small_oplog
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --small-oplog jsCore
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode commands --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --small-oplog jsCore
+
+- name: mongo-perf
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    git clone git://github.com/mongodb/mongo-perf.git
+    cd mongo-perf/mongo-cxx-driver && ${scons|scons}
+    cd mongo-perf && ${scons|scons}
+    cd mongo-perf && touch mongod.conf
+    if [ "${build_variant|}" =  "linux-64-new-query-framework" ] ;  then cd mongo-perf && (echo "setParameter = newQueryFrameworkEnabled=1" | tee -a mongod.conf) fi
+    cd mongo-perf && ${python|python} runner.py --config mongod.conf --rhost mongoperf-db.10gen.cc --port 30000 --mongod ../mongod --label ${build_variant|}
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          git clone git://github.com/mongodb/mongo-perf.git
+          cd mongo-perf/mongo-cxx-driver && ${scons|scons}
+          cd mongo-perf && ${scons|scons}
+          cd mongo-perf && touch mongod.conf
+          if [ "${build_variant|}" =  "linux-64-new-query-framework" ] ;  then cd mongo-perf && (echo "setParameter = newQueryFrameworkEnabled=1" | tee -a mongod.conf) fi
+          cd mongo-perf && ${python|python} runner.py --config mongod.conf --rhost mongoperf-db.10gen.cc --port 30000 --mongod ../mongod --label ${build_variant|}
+
+- name: mongosTest
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} mongosTest
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} mongosTest
+
+- name: mongosTest_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth mongosTest
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth mongosTest
+
+- name: multiversion
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    rm -rf /data/install /data/multiversion
+    ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6"
+    PATH=$PATH:/data/multiversion ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} multiVersion
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          rm -rf /data/install /data/multiversion
+          ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6"
+          PATH=$PATH:/data/multiversion ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} multiVersion
+
+- name: noPassthrough
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} noPassthrough
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} noPassthrough
+
+- name: noPassthroughWithMongod
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} noPassthroughWithMongod
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} noPassthroughWithMongod
+
+- name: slow1
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} slow1
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} slow1
+
+- name: slow2
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --clean-every=1 --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} slow2
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --clean-every=1 --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} slow2
+
+- name: parallel
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} parallel
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} parallel
+
+- name: parallel_compatibility
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode compatibility --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} parallel
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --shell-write-mode compatibility --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} parallel
+
+- name: qa_repo_multiversion_tests
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    -rm -rf /data/install /data/multiversion
+    -${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6"
+    -git clone git@github.com:10gen/QA.git
+    -${python|python} ./QA/mci/run_qa_repo_tests.py --multiversion-suite --mci-mode --mongo-repo-path=./ > test_files.out
+    -PATH=$PATH:/data/multiversion ${python|python} buildscripts/smoke.py --nopreallocj --continue-on-failure --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --mode=files $(cat test_files.out)
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          rm -rf /data/install /data/multiversion || true
+          ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6" || true
+          git clone git@github.com:10gen/QA.git || true
+          ${python|python} ./QA/mci/run_qa_repo_tests.py --multiversion-suite --mci-mode --mongo-repo-path=./ > test_files.out || true
+          PATH=$PATH:/data/multiversion ${python|python} buildscripts/smoke.py --nopreallocj --continue-on-failure --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --mode=files $(cat test_files.out) || true
+
+- name: qa_repo_tests
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    -git clone git@github.com:10gen/QA.git
+    -${python|python} ./QA/mci/run_qa_repo_tests.py --mci-mode --mongo-repo-path=./ > test_files.out
+    -${python|python} buildscripts/smoke.py --nopreallocj --continue-on-failure --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --mode=files $(cat test_files.out)
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          git clone git@github.com:10gen/QA.git || true
+          ${python|python} ./QA/mci/run_qa_repo_tests.py --mci-mode --mongo-repo-path=./ > test_files.out || true
+          ${python|python} buildscripts/smoke.py --nopreallocj --continue-on-failure --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --mode=files $(cat test_files.out) || true
+
+- name: replicasets
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} replSets
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} replSets
+
+- name: replicasets_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth replSets
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth replSets
+
+- name: replication
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} repl
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} repl
+
+- name: replication_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth repl
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth repl
+
+- name: sasl
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sasl
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sasl
+
+- name: sharding
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sharding
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sharding
+
+- name: sharding_auth
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth sharding
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} --auth sharding
+
+- name: snmp
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} snmp
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} snmp
+
+- name: ssl
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} ssl --use-ssl
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} ssl --use-ssl
+
+- name: sslSpecial
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    -${killall_mongod|killall mongod}
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sslSpecial
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} sslSpecial
+
+- name: tool
+  depends_on:
+  - name: compile
+  invoke: |
+    -mv artifacts/* .
+    ${decompress|unzip} mongodb*.${ext|tgz}
+    cp mongodb*/bin/* .
+    ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} tool
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: | 
+          ${decompress|unzip} mongodb*.${ext|tgz}
+          cp mongodb*/bin/* .
+          ${python|python} buildscripts/smoke.py --nopreallocj --with-cleanbb --mongod ./mongod --mongo ./mongo --report-file report.json ${test_flags|} --buildlogger-builder ${builder|} --buildlogger-buildnum ${builder_num|} --buildlogger-credentials ${config_root|}/mci.buildlogger --buildlogger-phase ${builder_phase|} tool
+
+- name: push
+  depends_on:
+  - name: "*"
+  invoke: "" # will be special-cased right now by the agent
+  commands:
+    - func: "fetch artifacts"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-latest.${ext|tgz}
+          cp debugsymbols-*.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} || true
+          ${sha1sum|sha1sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha1
+          ${sha256sum|sha256sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha256
+          ${sha1sum|sha1sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha1 || true
+          ${sha256sum|sha256sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha256 || true
+          /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-latest.msi || true
+          ${sha1sum|sha1sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.sha1 || true
+          ${sha256sum|sha256sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.sha256 || true
+          ${md5sum|md5sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.md5
+          ${md5sum|md5sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.md5 || true
+          ${md5sum|md5sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.md5 || true
+
+    - command: expansions.update
+      params:
+        file: src/compile_expansions.yml
+
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-latest.${ext|tgz} 
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+    - command: s3.put
+      params: 
+        aws_secret: ${aws_secret}
+        aws_key: ${aws_key}
+        build_variants: ["enterprise-linux-64-amazon-ami", "enterprise-rhel-57-64-bit", "enterprise-rhel-62-64-bit", "enterprise-rhel-70-64-bit", "enterprise-suse11-64", "enterprise-ubuntu1204-64", "enterprise-ubuntu1404-64", "enterprise-debian71-64", "linux-32", "linux-64", "ubuntu1404", "solaris-64-bit"]
+        permissions: public-read
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}
+        bucket: build-push-testing
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        permissions: public-read
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-latest.msi
+        bucket: build-push-testing
+        content_type: application/x-msi
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi
+    - command: s3.put
+      params: 
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha1
+        aws_key: ${aws_key}
+        permissions: public-read
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+    - command: s3.put
+      params: 
+        aws_secret: ${aws_secret}
+        aws_key: ${aws_key}
+        build_variants: ["enterprise-linux-64-amazon-ami", "enterprise-rhel-57-64-bit", "enterprise-rhel-62-64-bit", "enterprise-rhel-70-64-bit", "enterprise-suse11-64", "enterprise-ubuntu1204-64", "enterprise-ubuntu1404-64", "enterprise-debian71-64", "linux-32", "linux-64", "ubuntu1404", "solaris-64-bit"]
+        permissions: public-read
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha1
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1
+    - command: s3.put
+      params: 
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret} 
+        permissions: public-read
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-latest.msi.sha1 
+        bucket: build-push-testing
+        content_type: text/plain 
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha1
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha256
+        permissions: public-read
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+    - command: s3.put
+      params: 
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-linux-64-amazon-ami", "enterprise-rhel-57-64-bit", "enterprise-rhel-62-64-bit", "enterprise-rhel-70-64-bit", "enterprise-suse11-64", "enterprise-ubuntu1204-64", "enterprise-ubuntu1404-64", "enterprise-debian71-64", "linux-32", "linux-64", "ubuntu1404", "solaris-64-bit"]
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha256
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256
+    - command: s3.put
+      params: 
+        aws_key: ${aws_key} 
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-latest.msi.sha256
+        bucket: build-push-testing 
+        permissions: public-read
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha256
+        content_type: text/plain
+    - command: s3.put
+      params: 
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.md5
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+    - command: s3.put
+      params: 
+        aws_key: ${aws_key} 
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-linux-64-amazon-ami", "enterprise-rhel-57-64-bit", "enterprise-rhel-62-64-bit", "enterprise-rhel-70-64-bit", "enterprise-suse11-64", "enterprise-ubuntu1204-64", "enterprise-ubuntu1404-64", "linux-32", "linux-64", "ubuntu1404", "solaris-64-bit"]
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.md5
+        bucket: build-push-testing
+        content_type: text/plain
+        permissions: public-read
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5
+    - command: s3.put
+      params: 
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-latest.msi.md5
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.md5
+
+    - command: s3Copy.copy
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        s3_copy_files:
+            #Binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+
+            #Debug Symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'},
+               'build_variants': 
+                  ['enterprise-linux-64-amazon-ami',
+                   'enterprise-rhel-57-64-bit',
+                   'enterprise-rhel-62-64-bit',
+                   'enterprise-suse11-64',
+                   'enterprise-ubuntu1204-64',
+                   'enterprise-ubuntu1404-64',
+                   'enterprise-debian71-64',
+                   'linux-32',
+                   'linux-64',
+                   'ubuntu1404',
+                   'solaris-64-bit'] 
+              }
+
+            #MSI (Windows only)
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}.msi', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-32' ] }
+
+            #SHA1 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'}, 
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+
+            #SHA1 for debug symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'}, 'build_variants': ['enterprise-linux-64-amazon-ami', 'enterprise-rhel-57-64-bit', 'enterprise-rhel-62-64-bit', 'enterprise-suse11-64', 'enterprise-ubuntu1204-64', 'enterprise-ubuntu1404-64', 'enterprise-debian71-64', 'linux-32', 'linux-64', 'ubuntu1404', 'solaris-64-bit'], 
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+
+            #SHA1 for MSI
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha1', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.sha1', 'bucket': '${push_bucket}'},
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-32'] }
+
+            #SHA256 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'}, 
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+
+            #SHA256 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': [
+                   'enterprise-linux-64-amazon-ami',
+                   'enterprise-rhel-57-64-bit',
+                   'enterprise-rhel-62-64-bit',
+                   'enterprise-suse11-64',
+                   'enterprise-ubuntu1204-64',
+                   'enterprise-ubuntu1404-64',
+                   'enterprise-debian71-64',
+                   'linux-32',
+                   'linux-64',
+                   'ubuntu1404',
+                   'solaris-64-bit'
+               ]}
+
+            #SHA256 for MSI files
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha256', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-32'], }
+
+
+            #MD5 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'}, 
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
+
+            #MD5 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'}, 
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'},
+               'build_variants': [
+                  'enterprise-linux-64-amazon-ami',
+                  'enterprise-rhel-57-64-bit',
+                  'enterprise-rhel-62-64-bit',
+                  'enterprise-suse11-64',
+                  'enterprise-ubuntu1204-64',
+                  'enterprise-ubuntu1404-64',
+                  'linux-32',
+                  'linux-64',
+                  'ubuntu1404',
+                  'solaris-64-bit'] 
+                }
+
+            #MD5 for MSIs
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.md5', 'bucket': 'build-push-testing'},  
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.md5', 'bucket': '${push_bucket}'}, 
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-32'], }
+
+### modules ###
+
+modules:
+- name: enterprise
+  repo: git@github.com:10gen/mongo-enterprise-modules.git
+  prefix: src/mongo/db/modules
+  branch: master
+push:
+  expansionsfile: /data/expansions_s3.yml
+  pre: | # command to run to prepare the file to be pushed
+    -mv artifacts/* .
+    cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-latest.${ext|tgz}
+    -cp debugsymbols-*.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}
+    ${sha1sum|sha1sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha1
+    ${sha256sum|sha256sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha256
+    ${md5sum|md5sum} mongodb-${push_name}-${push_arch}-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.md5
+    -${md5sum|md5sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.md5
+    -${sha1sum|sha1sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha1
+    -${sha256sum|sha256sum} mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz} > mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha256
+    -/usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-latest.msi
+    -${sha1sum|sha1sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.sha1
+    -${sha256sum|sha256sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.sha256
+    -${md5sum|md5sum} mongodb-win32-${push_arch}-latest.msi > mongodb-win32-${push_arch}-latest.msi.md5
+
+  pushfiles: # list of files to be pushed. file is read from "localfile" and copied to "remotefile"
+    - localfile: mongodb-${push_name}-${push_arch}-latest.${ext|tgz}
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+      expansionsfile: compile_expansions.yml
+      contenttype: ${content_type|application/x-gzip}
+    - localfile: mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}
+      expansionsfile: compile_expansions.yml
+      contenttype: ${content_type|application/x-gzip}
+      buildvariants:
+        - enterprise-linux-64-amazon-ami
+        - enterprise-rhel-57-64-bit
+        - enterprise-rhel-62-64-bit
+        - enterprise-suse11-64
+        - enterprise-ubuntu1204-64
+        - enterprise-ubuntu1404-64
+        - enterprise-debian71-64
+        - linux-32
+        - linux-64
+        - ubuntu1404
+        - solaris-64-bit
+    - localfile: mongodb-win32-${push_arch}-latest.msi
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-win32-${push_arch}-${suffix}.msi
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi
+      contenttype: application/x-msi
+      buildvariants:
+        - enterprise-windows-64
+        - windows-64
+        - windows-64-2k8
+        - windows-32
+# SHA-1 push files
+    - localfile: mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha1
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+    - localfile: mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha1
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-linux-64-amazon-ami
+        - enterprise-rhel-57-64-bit
+        - enterprise-rhel-62-64-bit
+        - enterprise-suse11-64
+        - enterprise-ubuntu1204-64
+        - enterprise-ubuntu1404-64
+        - enterprise-debian71-64
+        - linux-32
+        - linux-64
+        - ubuntu1404
+        - solaris-64-bit
+    - localfile: mongodb-win32-${push_arch}-latest.msi.sha1
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.sha1
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha1
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-windows-64
+        - windows-64
+        - windows-64-2k8
+        - windows-32
+# SHA-256 push files
+    - localfile: mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.sha256
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+    - localfile: mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.sha256
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-linux-64-amazon-ami
+        - enterprise-rhel-57-64-bit
+        - enterprise-rhel-62-64-bit
+        - enterprise-suse11-64
+        - enterprise-ubuntu1204-64
+        - enterprise-ubuntu1404-64
+        - enterprise-debian71-64
+        - linux-32
+        - linux-64
+        - ubuntu1404
+        - solaris-64-bit
+    - localfile: mongodb-win32-${push_arch}-latest.msi.sha256
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.sha256
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.sha256
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-windows-64
+        - windows-64
+        - windows-64-2k8
+        - windows-32
+# MD-5 push files
+    - localfile: mongodb-${push_name}-${push_arch}-latest.${ext|tgz}.md5
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+    - localfile: mongodb-${push_name}-${push_arch}-debugsymbols-latest.${ext|tgz}.md5
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5
+      expansionsfile: compile_expansions.yml
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-linux-64-amazon-ami
+        - enterprise-rhel-57-64-bit
+        - enterprise-rhel-62-64-bit
+        - enterprise-suse11-64
+        - enterprise-ubuntu1204-64
+        - enterprise-ubuntu1404-64
+        - linux-32
+        - linux-64
+        - ubuntu1404
+        - solaris-64-bit
+    - localfile: mongodb-win32-${push_arch}-latest.msi.md5
+      remotefile: s3://s3_key:s3_secret@${push_bucket}/${push_path}/mongodb-win32-${push_arch}-${suffix}.msi.md5
+      stagefile: s3://s3_key:s3_secret@build-push-testing/${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}.msi.md5
+      contenttype: text/plain
+      buildvariants:
+        - enterprise-windows-64
+        - windows-64
+        - windows-64-2k8
+        - windows-32
+  post:
+    echo hi
+
+#######################################
+# Buildvariants
+#######################################
+
+buildvariants:
+
+###########################################
+#         Linux buildvariants             #
+###########################################
+
+- name: linux-64
+  display_name: Linux 64-bit
+  modules: ~
+  pluginmode: true
+  run_on:
+  - rhel55
+  - rhel55-test
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: multiversion
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: qa_repo_multiversion_tests
+  - name: qa_repo_tests
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: linux-64-debug
+  display_name: Linux 64-bit DEBUG
+  modules: ~
+  pluginmode: true
+  run_on:
+  - rhel55
+  - rhel55-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux-debug
+    push_arch: x86_64
+    test_flags: --continue-on-failure
+    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo)
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: tool
+
+- name: linux-64-duroff
+  display_name: Linux 64-bit DUR OFF
+  pluginmode: true
+  modules: ~
+  run_on:
+  - rhel55
+  - rhel55-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux-duroff
+    push_arch: x86_64
+    compile_flags: --durableDefaultOff -j$(grep -c ^processor /proc/cpuinfo)
+    has_debugsymbols: true
+    test_flags: --continue-on-failure
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: tool
+
+- name: linux-64-debug-duroff
+  display_name: Linux 64-bit DEBUG DUR OFF
+  pluginmode: true
+  modules: ~
+  run_on:
+  - rhel55
+  - rhel55-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux-debug-duroff
+    push_arch: x86_64
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+    compile_flags: --dbg=on --opt=on --durableDefaultOff -j$(grep -c ^processor /proc/cpuinfo)
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+
+- name: ubuntu1404
+  display_name: Ubuntu 1404 64-bit
+  modules: ~
+  pluginmode: true
+  run_on:
+  - ubuntu1404-test
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-ubuntu1404
+    compile_flags: --ssl --distmod=ubuntu1404 --no-glibc-check -j$(grep -c ^processor /proc/cpuinfo) --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1404-build
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: multiversion
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: qa_repo_multiversion_tests
+  - name: qa_repo_tests
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: enterprise-linux-64-amazon-ami
+  display_name: Enterprise Linux 64-bit Amazon AMI
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - linux-64-amzn-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-amzn64
+    compile_flags: --ssl --distmod=amzn64 --release -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - linux-64-amzn-build
+  - name: aggregation_auth
+  - name: audit
+  - name: auth
+  - name: failpoints_auth
+  - name: jsCore_auth
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: replicasets_auth
+  - name: replication_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: linux-32
+  display_name: Linux 32-bit
+  pluginmode: true
+  modules: ~
+  run_on:
+  - rhel55-32
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: i686
+    compile_flags: --release -j$(grep -c ^processor /proc/cpuinfo) --32
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: linux-32-debug
+  display_name: Linux 32-bit DEBUG
+  pluginmode: true
+  modules: ~
+  run_on:
+  - rhel55-32
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux-debug
+    push_arch: i686
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --32
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+
+- name: fedora8
+  display_name: Fedora 8
+  pluginmode: true
+  modules: ~
+  run_on:
+  - fedora8
+  expansions:
+    push_path: linux
+    push_name: fedora8
+    push_arch: x86_64
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel55
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: tool
+
+###########################################
+#         Windows buildvariants           #
+###########################################
+
+- name: windows-64
+  display_name: Windows 64-bit
+  pluginmode: true
+  modules: ~
+  run_on:
+  - windows-64-test
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.mongodb.org
+    push_name: win32
+    push_arch: x86_64
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --64 -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --continue-on-failure
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: qa_repo_tests
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: slow1
+  - name: slow2
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: windows-64-debug
+  display_name: Windows 64-bit DEBUG
+  pluginmode: true
+  modules: ~
+  run_on:
+  - windows-64-test
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.mongodb.org
+    push_name: win32-debug
+    push_arch: x86_64
+    content_type: application/zip
+    test_flags: --continue-on-failure
+    compile_flags: --dbg=on --opt=on --64 -j$(grep -c ^processor /proc/cpuinfo)
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+
+- name: windows-64-2k8
+  display_name: Windows 64-bit 2008R2+
+  pluginmode: true
+  modules: ~
+  run_on:
+  - windows-64-test
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.mongodb.org
+    push_name: win32
+    push_arch: x86_64-2008plus
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --64 --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) --distmod=2008plus
+    test_flags: --continue-on-failure
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: slow1
+  - name: slow2
+  - name: tool
+  - name: push 
+    distros:
+    - rhel55-test
+
+- name: windows-64-2k8-debug
+  display_name: Windows 64-bit 2008R2+ DEBUG
+  pluginmode: true
+  modules: ~
+  run_on:
+  - windows-64-test
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.mongodb.org
+    push_name: win32-debug
+    push_arch: x86_64-2008plus
+    content_type: application/zip
+    test_flags: --continue-on-failure
+    compile_flags: --dbg=on --opt=on --64 --win-version-min=ws08r2 -j$(grep -c ^processor /proc/cpuinfo) --distmod=2008plus
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+
+- name: enterprise-windows-64
+  display_name: Enterprise Windows 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - windows-64-test
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.10gen.com
+    push_name: win32
+    push_arch: x86_64-enterprise-windows-64
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --64 --ssl --distmod=windows-64 --extrapath="c:\openssl,c:\sasl,c:\snmp" -j$(grep -c ^processor /proc/cpuinfo) --dynamic-windows --win-version-min=ws08r2 
+    test_flags: --continue-on-failure
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: windows-32
+  display_name: Windows 32-bit
+  pluginmode: true
+  modules: ~
+  run_on:
+  - windows-32
+  expansions: 
+    push_path: win32
+    push_bucket: downloads.mongodb.org
+    push_name: win32
+    push_arch: i386
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --32 -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --continue-on-failure
+    ext: zip
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#             OSX buildvariants           #
+###########################################
+
+- name: osx-108
+  display_name: OS X 10.8
+  pluginmode: true
+  modules: ~
+  run_on:
+  - osx-108
+  expansions: 
+    push_path: osx
+    push_bucket: downloads.mongodb.org
+    push_name: osx
+    push_arch: x86_64
+    compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.6
+    test_flags: --continue-on-failure
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: slow1
+  - name: slow2
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: osx-108-debug
+  display_name: OS X 10.8 DEBUG
+  pluginmode: true
+  modules: ~
+  run_on:
+  - osx-108
+  expansions: 
+    push_path: osx
+    push_bucket: downloads.mongodb.org
+    push_name: osx-debug
+    push_arch: x86_64
+    test_flags: --continue-on-failure
+    compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu)
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: tool
+
+- name: osx-108-dur-off
+  display_name: OS X 10.8 DUR OFF
+  pluginmode: true
+  modules: ~
+  run_on:
+  - osx-108
+  expansions: 
+    push_path: osx
+    push_bucket: downloads.mongodb.org
+    push_name: osx-duroff
+    push_arch: x86_64
+    compile_flags: --durableDefaultOff --allocator=system -j$(sysctl -n hw.logicalcpu)
+    test_flags: --continue-on-failure
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: mongosTest_auth
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: slow2
+  - name: tool
+
+- name: osx-108-cxx11-debug
+  display_name: OS X 10.8 C++11 DEBUG
+  pluginmode: true
+  run_on:
+  - osx-108
+  expansions: 
+    push_path: osx
+    push_bucket: downloads.mongodb.org
+    push_name: osx-cxx11-debug
+    push_arch: x86_64
+    test_flags: --continue-on-failure
+    compile_flags: --dbg=on --opt=on --osx-version-min=10.7 --cc=/usr/bin/clang --cxx=/usr/bin/clang++ --c++11 --allocator=system --libc++ --ssl -j$(sysctl -n hw.logicalcpu)
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: mongosTest
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: ssl
+  - name: tool
+
+###########################################
+#          Redhat buildvariants           #
+###########################################
+- name: enterprise-rhel-57-64-bit
+  display_name: Enterprise RHEL 5.7 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - rhel57
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel57
+    compile_flags: --ssl --distmod=rhel57 -j$(grep -c ^processor /proc/cpuinfo) --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: enterprise-rhel-62-64-bit
+  display_name: Enterprise RHEL 6.2 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - rhel62
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel62
+    compile_flags: --ssl --distmod=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: enterprise-rhel-70-64-bit
+  display_name: Enterprise RHEL 7.0 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - rhel70
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel70
+    compile_flags: --ssl --distmod=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#          Ubuntu buildvariants           #
+###########################################
+
+- name: enterprise-ubuntu1204-64
+  display_name: Enterprise Ubuntu 1204 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1204-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-ubuntu1204
+    compile_flags: --no-glibc-check --ssl  --distmod=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1204-build
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: enterprise-ubuntu1404-64
+  display_name: Enterprise Ubuntu 1404 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1404-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-ubuntu1404
+    compile_flags: --no-glibc-check --ssl  --distmod=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1404-build
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#          SUSE buildvariants             #
+###########################################
+
+- name: enterprise-suse10-64
+  display_name: Enterprise SUSE 10 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - suse10
+  expansions:
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-suse10
+    compile_flags: --no-glibc-check --ssl --distmod=suse10 --release -j$(grep -c ^processor /proc/cpuinfo) --disable-warnings-as-errors
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+- name: enterprise-suse11-64
+  display_name: Enterprise SUSE 11 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - suse11
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-suse11
+    compile_flags: --no-glibc-check --ssl --distmod=suse11 --release -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#          Solaris buildvariants          #
+###########################################
+
+- name: solaris-64-bit
+  display_name: Solaris 64-bit
+  pluginmode: true
+  modules: ~
+  run_on:
+  - solaris
+  expansions:
+    push_path: sunos5
+    push_bucket: downloads.mongodb.org
+    push_name: sunos5
+    push_arch: x86_64
+    compile_flags: --cxx=/opt/gcc-4.6.3/bin/g++ --64 -j4 --release
+    test_flags: --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+  - name: aggregation
+  - name: auth
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: failpoints
+  - name: jsCore
+  - name: jsCore_compatibility
+  - name: jsCore_small_oplog
+  - name: mongosTest
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replicasets
+  - name: replication
+  - name: sharding
+  - name: slow1
+  - name: slow2
+  - name: tool
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#          Debian buildvariants           #
+###########################################
+
+- name: enterprise-debian71-64
+  display_name: Enterprise Debian 7.1 64-bit
+  pluginmode: true
+  modules:
+  - enterprise
+  run_on:
+  - debian71-test
+  expansions: 
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-debian71
+    compile_flags: --no-glibc-check --ssl  --distmod=debian71 --release -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: --authMechanism=CRAM-MD5 --continue-on-failure
+    has_debugsymbols: true
+  tasks:
+  - name: compile
+    distros: 
+    - debian71-build
+  - name: audit
+  - name: jsCore_auth
+  - name: replicasets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: push
+    distros:
+    - rhel55-test
+
+
+
